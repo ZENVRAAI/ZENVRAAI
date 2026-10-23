@@ -92,6 +92,9 @@ async def get_json(client: httpx.AsyncClient, url: str, params: dict[str, Any] |
         response = await client.get(url, params=params)
         response.raise_for_status()
         return response.json()
+    except httpx.HTTPStatusError as exc:
+        # Include the upstream status so deployment/network restrictions can be diagnosed.
+        raise HTTPException(status_code=502, detail=f"Market data provider request failed: HTTP {exc.response.status_code}") from exc
     except (httpx.HTTPError, ValueError) as exc:
         raise HTTPException(status_code=502, detail=f"Market data provider request failed: {type(exc).__name__}") from exc
 
