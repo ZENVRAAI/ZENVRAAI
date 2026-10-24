@@ -1,7 +1,8 @@
 """ZENVRA AI starter API.
 
 Signals-only research scaffold. It does not place orders and does not claim
-that any generated candidate is profitable. Public Binance market data only.
+that any generated candidate is profitable. Uses public exchange data with a
+CoinGecko fallback for Spot market summaries when Binance is blocked.
 """
 from __future__ import annotations
 
@@ -27,6 +28,7 @@ class Settings(BaseSettings):
     max_candle_age_seconds: int = 180
     binance_spot_base_url: str = "https://api.binance.com"
     binance_futures_base_url: str = "https://fapi.binance.com"
+    coingecko_base_url: str = "https://api.coingecko.com/api/v3"
 
     @property
     def symbols(self) -> list[str]:
@@ -43,7 +45,7 @@ class MarketSummary(BaseModel):
     change_24h_pct: float
     quote_volume_24h: float
     observed_at: str
-    source: str = "Binance public REST API"
+    source: str = "Public market-data API"
 
 
 class CandidateSignal(BaseModel):
@@ -111,26 +113,65 @@ async def markets(market: Literal["SPOT", "FUTURES"] = Query(default="SPOT"), sy
         raise HTTPException(status_code=400, detail="Provide 1–100 comma-separated symbols.")
     client = client_for(app)
     base = settings.binance_spot_base_url if market == "SPOT" else settings.binance_futures_base_url
-    # Pull the exchange's 24h ticker summaries and filter locally. This is a starter
-    # polling path; production should use streams and a broader eligible-symbol list.
+    # Try Binance first. Some hosting regions receive HTTP 451 from Binance.
     path = "/api/v3/ticker/24hr" if market == "SPOT" else "/fapi/v1/ticker/24hr"
-    data = await get_json(client, f"{base}{path}")
-    by_symbol = {str(row.get("symbol", "")).upper(): row for row in data if isinstance(row, dict)}
-    output: list[MarketSummary] = []
-    for symbol in selected:
-        row = by_symbol.get(symbol)
-        if not row:
-            continue
-        try:
-            output.append(MarketSummary(
-                symbol=symbol, market=market,
-                price=float(row["lastPrice"]),
-                change_24h_pct=float(row["priceChangePercent"]),
-                quote_volume_24h=float(row["quoteVolume"]), observed_at=now_iso(),
-            ))
-        except (KeyError, TypeError, ValueError):
-            continue
-    return output
+    try:
+        data = await get_json(client, f"{base}{path}")
+        by_symbol = {str(row.get("symbol", "")).upper(): row for row in data if isinstance(row, dict)}
+        output: list[MarketSummary] = []
+        for symbol in selected:
+            row = by_symbol.get(symbol)
+            if not row:
+                continue
+            try:
+                output.append(MarketSummary(
+                    symbol=symbol, market=market,
+                    price=float(row["lastPrice"]),
+                    change_24h_pct=float(row["priceChangePercent"]),
+                    quote_volume_24h=float(row["quoteVolume"]), observed_at=now_iso(),
+                    source="Binance public REST API",
+                ))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return output
+    except HTTPException:
+        if market != "SPOT":
+            raise
+        # CoinGecko's public markets endpoint provides Spot summaries without
+        # requiring an API key. It may have different coverage/rate limits.
+        aliases = {
+            "BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin",
+            "SOL": "solana", "XRP": "ripple", "ADA": "cardano",
+            "DOGE": "dogecoin", "TRX": "tron", "TON": "the-open-network",
+            "AVAX": "avalanche-2", "LINK": "chainlink", "DOT": "polkadot",
+            "LTC": "litecoin", "BCH": "bitcoin-cash", "SHIB": "shiba-inu",
+        }
+        base_symbols = [s[:-4] for s in selected if s.endswith("USDT")]
+        ids = list(dict.fromkeys(aliases[s] for s in base_symbols if s in aliases))
+        if not ids:
+            raise HTTPException(status_code=502, detail="Binance Spot is unavailable and no CoinGecko fallback mapping exists for these symbols.")
+        fallback = await get_json(
+            client, f"{settings.coingecko_base_url}/coins/markets",
+            params={"vs_currency": "usd", "ids": ",".join(ids), "price_change_percentage": "24h"},
+        )
+        by_symbol = {str(row.get("symbol", "")).upper(): row for row in fallback if isinstance(row, dict)}
+        output = []
+        for symbol in selected:
+            base_symbol = symbol[:-4] if symbol.endswith("USDT") else symbol
+            row = by_symbol.get(base_symbol)
+            if not row:
+                continue
+            try:
+                output.append(MarketSummary(
+                    symbol=symbol, market="SPOT",
+                    price=float(row["current_price"]),
+                    change_24h_pct=float(row.get("price_change_percentage_24h") or 0),
+                    quote_volume_24h=float(row.get("total_volume") or 0),
+                    observed_at=now_iso(), source="CoinGecko public API (USD market proxy)",
+                ))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return output
 
 
 def evaluate_candles(symbol: str, market: Literal["SPOT", "FUTURES"], rows: list[list[Any]]) -> CandidateSignal:
