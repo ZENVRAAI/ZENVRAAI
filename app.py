@@ -25,7 +25,7 @@ class Settings(BaseSettings):
     min_24h_quote_volume_usdt: float = 25_000_000
     min_reward_risk: float = 2.0
     max_candle_age_seconds: int = 180
-    binance_futures_base_url: str = "https://fapi.binance.com"
+    bybit_base_url: str = "https://api.bybit.com"
 
     @property
     def symbols(self) -> list[str]:
@@ -42,7 +42,7 @@ class MarketSummary(BaseModel):
     change_24h_pct: float
     quote_volume_24h: float
     observed_at: str
-    source: str = "Public market-data API"
+    source: str = "Bybit public linear Futures API"
 
 
 class CandidateSignal(BaseModel):
@@ -109,9 +109,15 @@ async def markets(market: Literal["FUTURES"] = Query(default="FUTURES"), symbols
     if not selected or len(selected) > 100:
         raise HTTPException(status_code=400, detail="Provide 1–100 comma-separated symbols.")
     client = client_for(app)
-    # Futures-only market data.
-    data = await get_json(client, f"{settings.binance_futures_base_url}/fapi/v1/ticker/24hr")
-    by_symbol = {str(row.get("symbol", "")).upper(): row for row in data if isinstance(row, dict)}
+    # Use Bybit public linear perpetual market data to avoid Binance regional HTTP 451.
+    response = await get_json(
+        client, f"{settings.bybit_base_url}/v5/market/tickers",
+        params={"category": "linear"},
+    )
+    if not isinstance(response, dict) or response.get("retCode") != 0:
+        raise HTTPException(status_code=502, detail="Bybit Futures market-data response was not recognized.")
+    rows = response.get("result", {}).get("list", [])
+    by_symbol = {str(row.get("symbol", "")).upper(): row for row in rows if isinstance(row, dict)}
     output: list[MarketSummary] = []
     for symbol in selected:
         row = by_symbol.get(symbol)
@@ -121,9 +127,9 @@ async def markets(market: Literal["FUTURES"] = Query(default="FUTURES"), symbols
             output.append(MarketSummary(
                 symbol=symbol, market="FUTURES",
                 price=float(row["lastPrice"]),
-                change_24h_pct=float(row["priceChangePercent"]),
-                quote_volume_24h=float(row["quoteVolume"]),
-                observed_at=now_iso(), source="Binance Futures public REST API",
+                change_24h_pct=float(row.get("price24hPcnt") or 0) * 100,
+                quote_volume_24h=float(row.get("turnover24h") or 0),
+                observed_at=now_iso(), source="Bybit public linear Futures API",
             ))
         except (KeyError, TypeError, ValueError):
             continue
@@ -171,7 +177,16 @@ async def candidate(symbol: str, market: Literal["FUTURES"] = Query(default="FUT
     symbol = symbol.upper().strip()
     if not symbol.isalnum() or len(symbol) > 24:
         raise HTTPException(status_code=400, detail="Invalid symbol format.")
-    rows = await get_json(client_for(app), f"{settings.binance_futures_base_url}/fapi/v1/klines", params={"symbol": symbol, "interval": interval, "limit": 100})
+    interval_map = {"5m": "5", "15m": "15", "1h": "60", "4h": "240", "1d": "D"}
+    response = await get_json(
+        client_for(app), f"{settings.bybit_base_url}/v5/market/kline",
+        params={"category": "linear", "symbol": symbol, "interval": interval_map[interval], "limit": 100},
+    )
+    if not isinstance(response, dict) or response.get("retCode") != 0:
+        raise HTTPException(status_code=502, detail="Bybit Futures candle response was not recognized.")
+    raw_rows = response.get("result", {}).get("list", [])
+    interval_ms = {"5m": 300_000, "15m": 900_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000}[interval]
+    rows = [[int(r[0]), r[1], r[2], r[3], r[4], r[5], int(r[0]) + interval_ms - 1] for r in reversed(raw_rows)]
     if not isinstance(rows, list):
         raise HTTPException(status_code=502, detail="Market data response format was not recognized.")
     return evaluate_candles(symbol, market, rows)
