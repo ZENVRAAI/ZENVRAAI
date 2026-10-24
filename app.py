@@ -1,8 +1,7 @@
 """ZENVRA AI starter API.
 
-Signals-only research scaffold. It does not place orders and does not claim
-that any generated candidate is profitable. Uses public exchange data with a
-CoinGecko fallback for Spot market summaries when Binance is blocked.
+Futures-only signals research scaffold. It does not place orders and does not
+claim that any generated candidate is profitable.
 """
 from __future__ import annotations
 
@@ -26,9 +25,7 @@ class Settings(BaseSettings):
     min_24h_quote_volume_usdt: float = 25_000_000
     min_reward_risk: float = 2.0
     max_candle_age_seconds: int = 180
-    binance_spot_base_url: str = "https://api.binance.com"
     binance_futures_base_url: str = "https://fapi.binance.com"
-    coingecko_base_url: str = "https://api.coingecko.com/api/v3"
 
     @property
     def symbols(self) -> list[str]:
@@ -40,7 +37,7 @@ settings = Settings()
 
 class MarketSummary(BaseModel):
     symbol: str
-    market: Literal["SPOT", "FUTURES"]
+    market: Literal["FUTURES"]
     price: float
     change_24h_pct: float
     quote_volume_24h: float
@@ -50,7 +47,7 @@ class MarketSummary(BaseModel):
 
 class CandidateSignal(BaseModel):
     symbol: str
-    market: Literal["SPOT", "FUTURES"]
+    market: Literal["FUTURES"]
     direction: Literal["LONG", "SHORT", "WAIT"]
     status: Literal["CANDIDATE", "WAIT", "REJECTED"]
     reference_price: float | None = None
@@ -107,74 +104,32 @@ async def health() -> Health:
 
 
 @app.get("/api/markets", response_model=list[MarketSummary])
-async def markets(market: Literal["SPOT", "FUTURES"] = Query(default="SPOT"), symbols: str | None = None) -> list[MarketSummary]:
+async def markets(market: Literal["FUTURES"] = Query(default="FUTURES"), symbols: str | None = None) -> list[MarketSummary]:
     selected = [s.strip().upper() for s in symbols.split(",") if s.strip()] if symbols else settings.symbols
     if not selected or len(selected) > 100:
         raise HTTPException(status_code=400, detail="Provide 1–100 comma-separated symbols.")
     client = client_for(app)
-    base = settings.binance_spot_base_url if market == "SPOT" else settings.binance_futures_base_url
-    # Try Binance first. Some hosting regions receive HTTP 451 from Binance.
-    path = "/api/v3/ticker/24hr" if market == "SPOT" else "/fapi/v1/ticker/24hr"
-    try:
-        data = await get_json(client, f"{base}{path}")
-        by_symbol = {str(row.get("symbol", "")).upper(): row for row in data if isinstance(row, dict)}
-        output: list[MarketSummary] = []
-        for symbol in selected:
-            row = by_symbol.get(symbol)
-            if not row:
-                continue
-            try:
-                output.append(MarketSummary(
-                    symbol=symbol, market=market,
-                    price=float(row["lastPrice"]),
-                    change_24h_pct=float(row["priceChangePercent"]),
-                    quote_volume_24h=float(row["quoteVolume"]), observed_at=now_iso(),
-                    source="Binance public REST API",
-                ))
-            except (KeyError, TypeError, ValueError):
-                continue
-        return output
-    except HTTPException:
-        if market != "SPOT":
-            raise
-        # CoinGecko's public markets endpoint provides Spot summaries without
-        # requiring an API key. It may have different coverage/rate limits.
-        aliases = {
-            "BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin",
-            "SOL": "solana", "XRP": "ripple", "ADA": "cardano",
-            "DOGE": "dogecoin", "TRX": "tron", "TON": "the-open-network",
-            "AVAX": "avalanche-2", "LINK": "chainlink", "DOT": "polkadot",
-            "LTC": "litecoin", "BCH": "bitcoin-cash", "SHIB": "shiba-inu",
-        }
-        base_symbols = [s[:-4] for s in selected if s.endswith("USDT")]
-        ids = list(dict.fromkeys(aliases[s] for s in base_symbols if s in aliases))
-        if not ids:
-            raise HTTPException(status_code=502, detail="Binance Spot is unavailable and no CoinGecko fallback mapping exists for these symbols.")
-        fallback = await get_json(
-            client, f"{settings.coingecko_base_url}/coins/markets",
-            params={"vs_currency": "usd", "ids": ",".join(ids), "price_change_percentage": "24h"},
-        )
-        by_symbol = {str(row.get("symbol", "")).upper(): row for row in fallback if isinstance(row, dict)}
-        output = []
-        for symbol in selected:
-            base_symbol = symbol[:-4] if symbol.endswith("USDT") else symbol
-            row = by_symbol.get(base_symbol)
-            if not row:
-                continue
-            try:
-                output.append(MarketSummary(
-                    symbol=symbol, market="SPOT",
-                    price=float(row["current_price"]),
-                    change_24h_pct=float(row.get("price_change_percentage_24h") or 0),
-                    quote_volume_24h=float(row.get("total_volume") or 0),
-                    observed_at=now_iso(), source="CoinGecko public API (USD market proxy)",
-                ))
-            except (KeyError, TypeError, ValueError):
-                continue
-        return output
+    # Futures-only market data.
+    data = await get_json(client, f"{settings.binance_futures_base_url}/fapi/v1/ticker/24hr")
+    by_symbol = {str(row.get("symbol", "")).upper(): row for row in data if isinstance(row, dict)}
+    output: list[MarketSummary] = []
+    for symbol in selected:
+        row = by_symbol.get(symbol)
+        if not row:
+            continue
+        try:
+            output.append(MarketSummary(
+                symbol=symbol, market="FUTURES",
+                price=float(row["lastPrice"]),
+                change_24h_pct=float(row["priceChangePercent"]),
+                quote_volume_24h=float(row["quoteVolume"]),
+                observed_at=now_iso(), source="Binance Futures public REST API",
+            ))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return output
 
-
-def evaluate_candles(symbol: str, market: Literal["SPOT", "FUTURES"], rows: list[list[Any]]) -> CandidateSignal:
+def evaluate_candles(symbol: str, market: Literal["FUTURES"], rows: list[list[Any]]) -> CandidateSignal:
     """Conservative baseline: detect directional momentum, otherwise WAIT.
 
     Not an ICT/SMC or trained-ML model. It purposely emits no entry/SL/TP unless
@@ -212,13 +167,11 @@ def evaluate_candles(symbol: str, market: Literal["SPOT", "FUTURES"], rows: list
 
 
 @app.get("/api/candidate/{symbol}", response_model=CandidateSignal)
-async def candidate(symbol: str, market: Literal["SPOT", "FUTURES"] = Query(default="SPOT"), interval: Literal["5m", "15m", "1h", "4h", "1d"] = Query(default="1h")) -> CandidateSignal:
+async def candidate(symbol: str, market: Literal["FUTURES"] = Query(default="FUTURES"), interval: Literal["5m", "15m", "1h", "4h", "1d"] = Query(default="1h")) -> CandidateSignal:
     symbol = symbol.upper().strip()
     if not symbol.isalnum() or len(symbol) > 24:
         raise HTTPException(status_code=400, detail="Invalid symbol format.")
-    base = settings.binance_spot_base_url if market == "SPOT" else settings.binance_futures_base_url
-    path = "/api/v3/klines" if market == "SPOT" else "/fapi/v1/klines"
-    rows = await get_json(client_for(app), f"{base}{path}", params={"symbol": symbol, "interval": interval, "limit": 100})
+    rows = await get_json(client_for(app), f"{settings.binance_futures_base_url}/fapi/v1/klines", params={"symbol": symbol, "interval": interval, "limit": 100})
     if not isinstance(rows, list):
         raise HTTPException(status_code=502, detail="Market data response format was not recognized.")
     return evaluate_candles(symbol, market, rows)
@@ -226,4 +179,4 @@ async def candidate(symbol: str, market: Literal["SPOT", "FUTURES"] = Query(defa
 
 @app.get("/api/config")
 async def config() -> dict[str, Any]:
-    return {"service": settings.app_name, "markets": ["SPOT", "FUTURES"], "mode": "signals_only", "paper_only": True, "execution_enabled": False, "candidate_symbols": settings.symbols, "scan_interval_seconds": settings.scan_interval_seconds, "note": "Candidate engine is a simple baseline, not a validated AI trading strategy."}
+    return {"service": settings.app_name, "markets": ["FUTURES"], "mode": "signals_only", "paper_only": True, "execution_enabled": False, "candidate_symbols": settings.symbols, "scan_interval_seconds": settings.scan_interval_seconds, "note": "Candidate engine is a simple baseline, not a validated AI trading strategy."}
