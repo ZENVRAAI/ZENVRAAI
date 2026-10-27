@@ -7,8 +7,12 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Ensure the repository root is importable when this script is launched from scripts/.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import httpx
 
