@@ -1,4 +1,4 @@
-name: ZENVRA AI scheduled market scan
+name: ZENVRA AI autonomous market scanner
 
 on:
   schedule:
@@ -9,13 +9,13 @@ permissions:
   contents: read
 
 concurrency:
-  group: zenvra-scheduled-scan
+  group: zenvra-autonomous-market-scan
   cancel-in-progress: false
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -30,16 +30,30 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run existing safety tests
+      - name: Run software safety tests
         run: pytest -q
 
-      - name: Scan public Bybit linear Futures market data
+      - name: Scan liquid Bybit USDT perpetual markets
+        env:
+          SCAN_TOP_N: "50"
+          MIN_TURNOVER_USDT: "5000000"
+          SCAN_CONCURRENCY: "6"
         run: python scripts/scan_market.py
 
-      - name: Save scan report
+      - name: Publish scan summary in workflow
+        if: always()
+        run: |
+          if [ -f scan-output/scan-report.md ]; then
+            cat scan-output/scan-report.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## ZENVRA AI scan did not produce a report" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Save JSON and Markdown reports
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: zenvra-scan-report
-          path: scan-report.md
-          if-no-files-found: error
-          retention-days: 7
+          name: zenvra-autonomous-scan-${{ github.run_number }}
+          path: scan-output/
+          if-no-files-found: warn
+          retention-days: 14
