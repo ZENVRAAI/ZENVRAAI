@@ -33,7 +33,7 @@ jobs:
       - name: Run existing safety tests
         run: pytest -q
 
-      - name: Scan public Binance market data
+      - name: Scan public Bybit linear Futures market data
         run: python scripts/scan_market.py
 
       - name: Save scan report
