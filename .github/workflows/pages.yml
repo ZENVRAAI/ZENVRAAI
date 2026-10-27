@@ -2,7 +2,7 @@ name: Deploy ZENVRA AI PWA to GitHub Pages
 on:
   push:
     branches: ["main"]
-    paths: ["index.html", "manifest.webmanifest", "sw.js", "icon.svg", ".github/workflows/pages.yml"]
+    paths: ["index.html", "institutional.js", "manifest.webmanifest", "sw.js", "icon.svg", ".github/workflows/pages.yml"]
   workflow_dispatch:
 permissions:
   contents: read
@@ -19,7 +19,7 @@ jobs:
       - name: Prepare static PWA
         run: |
           mkdir -p _site
-          cp index.html manifest.webmanifest sw.js icon.svg _site/
+          cp index.html institutional.js manifest.webmanifest sw.js icon.svg _site/
           touch _site/.nojekyll
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
